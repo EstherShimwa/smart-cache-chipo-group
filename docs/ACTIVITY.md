@@ -141,7 +141,9 @@ Look at `BrokenDraftsView` at the bottom of `views.py`.
 
 > What is the bug in `BrokenDraftsView`?
 
-The cache key is the generic string `"my-drafts"`. It does not include the user id, so one shared entry is reused for every authenticated user. Authentication still runs, but the cache lookup happens with a global key, so the first user's drafts are served to everyone else.
+The bug in `BrokenDraftsView` is that it uses a hardcoded cache key, "my-drafts" instead of a per-user-key. 
+This means that all users share one single cache entry. Once any user's drafts are cached under that key, the following user who hits the endpoint
+gets a cache hit and gets the first user's drafts until the entry expires.
 
 ---
 
@@ -149,21 +151,26 @@ The cache key is the generic string `"my-drafts"`. It does not include the user 
 > 1. Alice logs in and calls `/api/posts/broken-drafts/`
 > 2. Bob logs in and calls `/api/posts/broken-drafts/`
 
-1. Alice is authenticated. Cache miss on `"my-drafts"`. The view queries Alice's drafts, stores them under `"my-drafts"`, and returns Alice's drafts.
-2. Bob is authenticated. Cache **hit** on `"my-drafts"`. The view never queries Bob's drafts. Bob receives **Alice's** drafts.
+1. Alice will log in and call `/api/posts/broken-drafts/`. `cache.get("my-drafts")` returns None, so the database is
+queried for Alice's drafts. The results are serialized and stored in the cache under the key `"my-drafts"` with a 120-seconds timeout.\n
+\n
+
+2. Bob will log in and call `/api/posts/broken-drafts/` within the 120-seconds window. `cache.get("my-drafts")` now returns
+a value, so the database is not queried for Bob at all. His own drafts he doesn't receive, he receives Alice's stored drafts.
 
 ---
 
 > What is the real-world impact of this bug if it shipped to production?
 
-Private drafts leak across accounts. Any user who hits the endpoint after someone else can read unpublished titles, content, and author identity. That is a confidentiality / data-isolation failure (and a likely GDPR/privacy incident if this were a real product).
+Drafts are any work that the author has not yet decided to publish. This bug would affect any authenticated user who calls the endpoint 
+after one user has already called it. They would receive the previous user's draft content from the storage cache. This bug is dangerous because it fails silently with no errors thrown and a 200 OK response. It could run for a long time without being caught and continuously leaking data.
 
 ---
 
 > What is the one-line fix?
 
-Include the user id in the key, e.g. `cache.get(f"drafts:user:{request.user.id}")` — the same pattern as `MyDraftsView`. Do **not** change `BrokenDraftsView` itself; it is the bug-spotting example.
-
+`cache_key = f"drafts:user:{request.user.id}"` is the one line fix I would implement to replace the hardcoded cache key 
+with a per-user cache key. I would also update the `cache.get()` and `cache.set()` to match the pattern used in `MyDraftsView`
 ---
 
 ## Level 4 — Invalidation (10 min)
