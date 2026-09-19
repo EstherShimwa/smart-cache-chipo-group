@@ -18,7 +18,7 @@ BASE_URL = "http://127.0.0.1:8000"
 
 ENDPOINTS = [
     ("All Posts (list)", f"{BASE_URL}/api/posts/"),
-    ("Single Post (id=1)", f"{BASE_URL}/api/posts/1/"),
+    ("Single Post (id=2)", f"{BASE_URL}/api/posts/2/"),
 ]
 
 

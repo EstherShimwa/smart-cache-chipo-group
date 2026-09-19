@@ -75,8 +75,8 @@ python timing.py
 
 | Endpoint | First Request | Average |
 |----------|--------------|---------|
-| All Posts | ___ms | ___ms |
-| Single Post | ___ms | ___ms |
+| All Posts | 36.4ms | 13.5ms |
+| Single Post | 2.1ms | 1.2ms |
 
 You'll run this again after each level to see how much you've improved.
 
@@ -114,6 +114,8 @@ cache.set("your-key", data, timeout=300)   # stores data for 300 seconds
 > **Discussion:** What cache key did you choose for the list endpoint?
 > Compare with a classmate — did you choose the same key? Why or why not?
 
+We used a **shared** key, `posts:list`, because published posts are public — every caller should see the same list. A username in the key would waste memory with duplicate copies of identical data. The stretch goal extends this to `posts:list:v{version}:{query}` so `?page=2` cannot overwrite the unfiltered list, and Level 4 can bust every variant by bumping the version.
+
 ---
 
 ## Level 3 — Protect Personal Data (15 min)
@@ -139,7 +141,7 @@ Look at `BrokenDraftsView` at the bottom of `views.py`.
 
 > What is the bug in `BrokenDraftsView`?
 
-_Your answer:_
+The cache key is the generic string `"my-drafts"`. It does not include the user id, so one shared entry is reused for every authenticated user. Authentication still runs, but the cache lookup happens with a global key, so the first user's drafts are served to everyone else.
 
 ---
 
@@ -147,19 +149,20 @@ _Your answer:_
 > 1. Alice logs in and calls `/api/posts/broken-drafts/`
 > 2. Bob logs in and calls `/api/posts/broken-drafts/`
 
-_Your answer:_
+1. Alice is authenticated. Cache miss on `"my-drafts"`. The view queries Alice's drafts, stores them under `"my-drafts"`, and returns Alice's drafts.
+2. Bob is authenticated. Cache **hit** on `"my-drafts"`. The view never queries Bob's drafts. Bob receives **Alice's** drafts.
 
 ---
 
 > What is the real-world impact of this bug if it shipped to production?
 
-_Your answer:_
+Private drafts leak across accounts. Any user who hits the endpoint after someone else can read unpublished titles, content, and author identity. That is a confidentiality / data-isolation failure (and a likely GDPR/privacy incident if this were a real product).
 
 ---
 
 > What is the one-line fix?
 
-_Your answer:_
+Include the user id in the key, e.g. `cache.get(f"drafts:user:{request.user.id}")` — the same pattern as `MyDraftsView`. Do **not** change `BrokenDraftsView` itself; it is the bug-spotting example.
 
 ---
 
@@ -191,6 +194,14 @@ cache.delete("your-key-here")   # removes the stale entry
 > **Discussion:** What's the difference between `cache.delete()` and
 > updating the cache with the new data directly? When would you choose each?
 
+`cache.delete()` **invalidates**: it drops the stale entry. The next GET is a miss and rebuilds from the database. That is the safe default for a **list**, because the cached value is a full queryset (and, with the stretch goal, several query-aware variants). Rebuilding the exact cached shape on every POST is easy to get wrong.
+
+Updating the cache directly is **write-through**: you already have the new object, so you `cache.set` it. We do that for a newly created **published** post (`posts:detail:{id}`), because the serializer data is already in hand.
+
+Choose delete for collections / many keys. Choose write-through for a single object you just saved.
+
+**Tested:** `GET /api/posts/` cached the published list, `POST` created a new published post, the next `GET` returned count+1 and included the new title. Creating a draft also deletes `drafts:user:{id}` so Person 3's cache cannot hide the new draft.
+
 ---
 
 ## Stretch Goal — Query-Aware Cache Key
@@ -213,6 +224,8 @@ params = request.query_params.urlencode()   # turns params into a string
 cache_key = f"posts:list:{params}"
 ```
 
+Implemented in `PostListView.get()`. The live key is `posts:list:v{version}:{params or "all"}`. Level 4 bumps `posts:list:version` on POST so every query-aware variant is busted at once (LocMemCache has no `delete_pattern`).
+
 ---
 
 ## Final Check — Run the Timer One More Time
@@ -225,8 +238,8 @@ python timing.py
 
 | Endpoint | Before (Level 1) | After (Level 4) | Improvement |
 |----------|-----------------|-----------------|-------------|
-| All Posts | ___ms | ___ms | ___% faster |
-| Single Post | ___ms | ___ms | ___% faster |
+| All Posts | 36.4ms (cache miss / DB) | 1.8ms (cache hit) | ~95% faster |
+| Single Post | 2.1ms (cache miss / DB) | 0.8ms (cache hit) | ~62% faster |
 
 ---
 
@@ -236,10 +249,16 @@ Answer these before the debrief:
 
 1. Why did you use a **shared** key for `/api/posts/` but a **user-specific** key for `/my-drafts/`?
 
+   Published posts are the same for every caller, so one shared key (`posts:list`) is correct and cheaper. Drafts are private. A shared key would leak User A's drafts to User B (exactly the `BrokenDraftsView` bug). The drafts key must include `request.user.id`.
+
 2. What would happen if you set `timeout=None` on the post list cache?
+
+   The entry would never expire on its own. After a restart the LocMemCache is empty anyway, but while the process is up the list would stay stale forever **unless** we invalidate on write. That is why Level 4's `cache.delete` / version bump is required — TTL is a safety net, not a substitute for invalidation. `timeout=None` plus missing invalidation = users never see new posts.
 
 3. In what situation would caching `/my-drafts/` actually cause a bug even with the correct user-specific key?
    *(Hint: think about what happens when a user saves a new draft)*
+
+   If a user creates a new draft via `POST /api/posts/` while `drafts:user:{id}` is still warm, the next `GET /my-drafts/` would return the **old** list until the 120s TTL expires. Correct isolation does not fix staleness. Level 4 deletes that user's drafts key when the new post is a draft.
 
 ---
 
@@ -247,11 +266,11 @@ Answer these before the debrief:
 
 By the end of this activity you should be able to:
 
-- [ ] Explain what cache-aside (lazy loading) means in your own words
-- [ ] Design a cache key that is shared, user-specific, or query-aware as needed
-- [ ] Explain why authentication must happen **before** the cache lookup
-- [ ] Implement cache invalidation when underlying data changes
-- [ ] Identify a cache key bug and explain its security impact
+- [x] Explain what cache-aside (lazy loading) means in your own words
+- [x] Design a cache key that is shared, user-specific, or query-aware as needed
+- [x] Explain why authentication must happen **before** the cache lookup
+- [x] Implement cache invalidation when underlying data changes
+- [x] Identify a cache key bug and explain its security impact
 
 ---
 

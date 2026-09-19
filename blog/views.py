@@ -28,6 +28,47 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Cache keys — one source of truth for GET (read) and POST (invalidate)
+# ---------------------------------------------------------------------------
+
+POSTS_LIST_KEY = "posts:list"
+POSTS_LIST_VERSION_KEY = "posts:list:version"
+POSTS_LIST_TTL = 300          # 5 minutes — list changes often
+POST_DETAIL_TTL = 600         # 10 minutes — a single post changes rarely
+
+
+def _posts_list_cache_key(query_string: str = "") -> str:
+    """Shared list key, plus query params so filters/pages don't collide.
+
+    Stretch goal: ``?status=published`` and ``?page=2`` each get their own entry.
+    The version prefix lets Level 4 bust every variant at once — LocMemCache
+    has no ``delete_pattern``.
+    """
+    version = cache.get(POSTS_LIST_VERSION_KEY) or 0
+    suffix = query_string or "all"
+    return f"{POSTS_LIST_KEY}:v{version}:{suffix}"
+
+
+def _invalidate_posts_list_cache() -> None:
+    """Level 4 — drop the canonical key and bump the version.
+
+    Bumping the version makes every query-aware key (``posts:list:vN:...``)
+    unreachable. Old entries expire on their own TTL.
+    """
+    cache.delete(POSTS_LIST_KEY)
+    version = cache.get(POSTS_LIST_VERSION_KEY) or 0
+    cache.set(POSTS_LIST_VERSION_KEY, version + 1, timeout=None)
+
+
+def _post_detail_cache_key(post_id: int) -> str:
+    return f"posts:detail:{post_id}"
+
+
+def _drafts_cache_key(user_id: int) -> str:
+    return f"drafts:user:{user_id}"
+
+
+# ---------------------------------------------------------------------------
 # LEVEL 2 — Shared Cache (Public Data)
 # ---------------------------------------------------------------------------
 
@@ -43,37 +84,50 @@ class PostListView(APIView):
         return [AllowAny()]
 
     def get(self, request):
-        # ---------------------------------------------------------------
-        # TODO (Level 2): Implement cache-aside for this endpoint.
-        #
-        # Requirements:
-        #   - Cache key: should be shared across ALL users (it's public data)
-        #   - TTL: 300 seconds (5 minutes)
-        #   - On cache miss: query the DB, store in cache, return data
-        #   - On cache hit: return cached data directly
-        #
-        # Hint: use `cache.get(key)` and `cache.set(key, value, timeout)`
-        # ---------------------------------------------------------------
+        # Shared key: every caller sees the same published list.
+        # Stretch: query params are part of the key so pages/filters don't collide.
+        params = request.query_params.urlencode()
+        cache_key = _posts_list_cache_key(params)
 
-        # REMOVE these two lines once you implement the cache below
+        data = cache.get(cache_key)
+        if data is not None:                     # HIT
+            return Response(data)
+
+        # MISS: query the DB, then cache-aside
         posts = Post.objects.filter(status=Post.STATUS_PUBLISHED).select_related("author")
-        serializer = PostSerializer(posts, many=True)
-        return Response(serializer.data)
+        data = PostSerializer(posts, many=True).data
+        cache.set(cache_key, data, timeout=POSTS_LIST_TTL)
+        cache.set(POSTS_LIST_KEY, data, timeout=POSTS_LIST_TTL)
+        return Response(data)
 
     def post(self, request):
         # ---------------------------------------------------------------
-        # TODO (Level 4): After saving the new post, invalidate the cache
-        # so the next GET reflects the new data.
+        # LEVEL 4 — Invalidate after mutation so GET is never stale.
         #
-        # Question: which cache key do you need to delete here?
+        # cache.delete() drops the old entry; the next GET rebuilds from DB.
+        # That is safer than writing the new list into the cache here:
+        # we would have to rebuild every query-aware variant correctly.
+        # Write-through is better for a single object we already serialized.
         # ---------------------------------------------------------------
 
         serializer = PostSerializer(data=request.data)
         if serializer.is_valid():
-            serializer.save(author=request.user)
+            post = serializer.save(author=request.user)
 
-            # Invalidate the shared published-posts cache
-            cache.delete("published-posts")
+            # Always bust the published list — a new published post must appear,
+            # and a status change away from draft would also change the list.
+            _invalidate_posts_list_cache()
+
+            if post.status == Post.STATUS_PUBLISHED:
+                # Write-through: we already have the serialized object.
+                cache.set(
+                    _post_detail_cache_key(post.id),
+                    serializer.data,
+                    timeout=POST_DETAIL_TTL,
+                )
+            else:
+                # A new draft would otherwise stay invisible until TTL (2 min).
+                cache.delete(_drafts_cache_key(request.user.id))
 
             return Response(serializer.data, status=status.HTTP_201_CREATED)
 
@@ -92,18 +146,13 @@ class PostDetailView(APIView):
     permission_classes = [AllowAny]
 
     def get(self, request, post_id: int):
-        # ---------------------------------------------------------------
-        # TODO (Level 2): Implement cache-aside for a single post.
-        #
-        # Requirements:
-        #   - Cache key: must be unique per post (include the post_id)
-        #   - TTL: 600 seconds (10 minutes)
-        #   - Return 404 if the post does not exist
-        #
-        # Think: why is a longer TTL acceptable here vs the list endpoint?
-        # ---------------------------------------------------------------
+        # Unique per post. Longer TTL is fine: one post mutates less than the list.
+        cache_key = _post_detail_cache_key(post_id)
 
-        # REMOVE these lines once you implement the cache below
+        data = cache.get(cache_key)
+        if data is not None:                     # HIT
+            return Response(data)
+
         try:
             post = Post.objects.select_related("author").get(
                 id=post_id, status=Post.STATUS_PUBLISHED
@@ -111,8 +160,9 @@ class PostDetailView(APIView):
         except Post.DoesNotExist:
             return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
 
-        serializer = PostSerializer(post)
-        return Response(serializer.data)
+        data = PostSerializer(post).data
+        cache.set(cache_key, data, timeout=POST_DETAIL_TTL)
+        return Response(data)
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +184,7 @@ class MyDraftsView(APIView):
         # SECURITY: the key includes the user's ID, so every user gets their own
         # cache entry. With a shared key like "my-drafts", the first user's drafts
         # would be served to every other user.
-        cache_key = f"drafts:user:{request.user.id}"
+        cache_key = _drafts_cache_key(request.user.id)
 
         data = cache.get(cache_key)
         if data is not None:                     # HIT
